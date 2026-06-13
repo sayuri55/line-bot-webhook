@@ -1,42 +1,29 @@
+import os
+import hmac
+import hashlib
+import base64
+import json
+import requests
 from flask import Flask, request, abort
-import hashlib, hmac, base64, json, os, requests
-import anthropic
+import google.generativeai as genai
 
 app = Flask(__name__)
 
 CHANNEL_SECRET = os.environ['LINE_CHANNEL_SECRET']
-ACCESS_TOKEN = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
-ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
+CHANNEL_TOKEN  = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
 
-user_images = {}
+genai.configure(api_key=os.environ['GEMINI_API_KEY'])
 
-def verify_signature(body, signature):
-    hash = hmac.new(CHANNEL_SECRET.encode(), body.encode(), hashlib.sha256).digest()
-    return base64.b64encode(hash).decode() == signature
+PROMPT = """この画像から情報を抽出して、以下のフォーマットに当てはめて出力してください。
+フォーマット以外の文章は一切出力しないでください。
 
-def get_line_image(message_id):
-    url = f'https://api-data.line.me/v2/bot/message/{message_id}/content'
-    res = requests.get(url, headers={'Authorization': f'Bearer {ACCESS_TOKEN}'})
-    return res.content
-
-def reply(reply_token, text):
-    requests.post('https://api.line.me/v2/bot/message/reply', json={
-        'replyToken': reply_token,
-        'messages': [{'type': 'text', 'text': text}]
-    }, headers={'Authorization': f'Bearer {ACCESS_TOKEN}'})
-
-def analyze_images(images_data):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    content = []
-    for img in images_data:
-        content.append({
-            'type': 'image',
-            'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': base64.b64encode(img).decode()}
-        })
-    content.append({
-        'type': 'text',
-        'text': '''送られた書類の画像から情報を抽出して、以下のフォーマットで出力してください。
-情報がない場合は空欄のままにしてください。
+【抽出ルール】
+・地番：画像中の「供給地点特定番号」（22桁の数字）を入れる。住所は入れない。
+・名義：氏名のスペースは全角スペース（　）で入れる。
+・カナ：スペース・空白は一切入れない。
+・容量：数字とアルファベットのみ記載する（例：60A、6KW）。「電灯」「動力」などの文字は除く。
+・適用月：画像の「検針日」の年月日を入れる（例：2026年6月13日）。検針日の記載がない場合は、利用期間の終了日の翌月の同日を入れる（例：終了日が2026年5月25日なら2026年6月25日）。
+・該当する情報が見つからない場合はその項目を空白のままにする。
 
 （登録契約情報）
 ・生年月日：
@@ -57,62 +44,69 @@ def analyze_images(images_data):
 客番：
 容量：
 適用月：
-使用量：
+使用量："""
 
 
-②＝マッチング情報＝
-・地番：
-・住所：
-・名義：
-・カナ：
-電力会社：
-客番：
-容量：
-適用月：
-使用量：
+def verify_signature(body: bytes, signature: str) -> bool:
+    digest = hmac.new(
+        CHANNEL_SECRET.encode('utf-8'), body, hashlib.sha256
+    ).digest()
+    return signature == base64.b64encode(digest).decode('utf-8')
 
-複数の電力会社の検針票がある場合は①②に分けて入力してください。
-申込書がある場合はそこから登録契約情報を抽出してください。'''
-    })
-    message = client.messages.create(
-        model='claude-opus-4-8',
-        max_tokens=2000,
-        messages=[{'role': 'user', 'content': content}]
+
+def get_line_image(message_id: str) -> bytes:
+    res = requests.get(
+        f'https://api-data.line.me/v2/bot/message/{message_id}/content',
+        headers={'Authorization': f'Bearer {CHANNEL_TOKEN}'},
+        timeout=15
     )
-    return message.content[0].text
+    res.raise_for_status()
+    return res.content
 
-@app.route('/callback', methods=['POST'])
-def callback():
+
+def extract_info(image_bytes: bytes) -> str:
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    response = model.generate_content([
+        {'mime_type': 'image/jpeg', 'data': image_bytes},
+        PROMPT
+    ])
+    return response.text
+
+
+def reply(reply_token: str, text: str):
+    requests.post(
+        'https://api.line.me/v2/bot/message/reply',
+        headers={
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {CHANNEL_TOKEN}'
+        },
+        json={
+            'replyToken': reply_token,
+            'messages': [{'type': 'text', 'text': text}]
+        },
+        timeout=10
+    )
+
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    raw_body = request.get_data()
     signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    if not verify_signature(body, signature):
+
+    if not verify_signature(raw_body, signature):
         abort(400)
-    events = json.loads(body).get('events', [])
-    for event in events:
-        user_id = event.get('source', {}).get('userId', '')
-        reply_token = event.get('replyToken', '')
-        if event.get('type') == 'message':
-            msg = event.get('message', {})
-            if msg.get('type') == 'image':
-                img_data = get_line_image(msg['id'])
-                if user_id not in user_images:
-                    user_images[user_id] = []
-                user_images[user_id].append(img_data)
-                reply(reply_token, f'画像を受け取りました（{len(user_images[user_id])}枚）。\n全部送り終わったら「完了」と送ってください。')
-            elif msg.get('type') == 'text':
-                text = msg.get('text', '')
-                if text == '完了' and user_id in user_images and user_images[user_id]:
-                    reply(reply_token, '画像を解析中です。少々お待ちください...')
-                    result = analyze_images(user_images[user_id])
-                    user_images[user_id] = []
-                    requests.post('https://api.line.me/v2/bot/message/push', json={
-                        'to': user_id,
-                        'messages': [{'type': 'text', 'text': result}]
-                    }, headers={'Authorization': f'Bearer {ACCESS_TOKEN}'})
-                else:
-                    reply(reply_token, '書類の写真を送ってください。全部送り終わったら「完了」と送ってください。')
+
+    for event in json.loads(raw_body).get('events', []):
+        if event.get('type') == 'message' and event['message'].get('type') == 'image':
+            try:
+                image = get_line_image(event['message']['id'])
+                result = extract_info(image)
+                reply(event['replyToken'], result)
+            except Exception as e:
+                reply(event['replyToken'], f'エラーが発生しました。もう一度お試しください。\n({e})')
+
     return 'OK'
 
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
