@@ -14,15 +14,17 @@ CHANNEL_TOKEN  = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
 
 genai.configure(api_key=os.environ['GEMINI_API_KEY'])
 
+user_images = {}
+
 PROMPT = (
-    "この画像から情報を抽出して、以下のフォーマットに当てはめて出力してください。\n"
+    "複数の画像（申込書・電気代請求書など）を総合して情報を抽出し、以下のフォーマットに出力してください。\n"
     "フォーマット以外の文章は一切出力しないでください。\n\n"
     "【抽出ルール】\n"
-    "・地番：画像中の供給地点特定番号（22桁の数字）を入れる。住所は入れない。\n"
-    "・名義：氏名のスペースは全角スペースで入れる。\n"
+    "・地番：供給地点特定番号（22桁の数字のみ）を入れる。数字以外は除く。住所は絶対に入れない。\n"
+    "・名義：漢字を正確に読み取る。スペースは全角スペースで入れる。\n"
     "・カナ：スペース・空白は一切入れない。\n"
-    "・容量：数字とアルファベットのみ記載する（例：60A、6KW）。電灯・動力などの文字は除く。\n"
-    "・適用月：画像の検針日の年月日を入れる（例：2026年6月13日）。検針日の記載がない場合は、利用期間の終了日の翌月の同日を入れる。\n"
+    "・容量：数字とアルファベットのみ（例：60A、6KW）。B・低圧・電灯・動力・契約種別などの文字はすべて除く。\n"
+    "・適用月：検針日の年月日（例：2026年6月13日）。検針日がない場合は利用期間の終了日の翌月の同日。\n"
     "・該当する情報が見つからない場合はその項目を空白のままにする。\n\n"
     "（登録契約情報）\n"
     "・生年月日：\n"
@@ -62,12 +64,13 @@ def get_line_image(message_id: str) -> bytes:
     return res.content
 
 
-def extract_info(image_bytes: bytes) -> str:
+def extract_info(images_list: list) -> str:
     model = genai.GenerativeModel('gemini-2.5-flash')
-    response = model.generate_content([
-        {'mime_type': 'image/jpeg', 'data': image_bytes},
-        PROMPT
-    ])
+    parts = []
+    for img in images_list:
+        parts.append({'mime_type': 'image/jpeg', 'data': img})
+    parts.append(PROMPT)
+    response = model.generate_content(parts)
     return response.text
 
 
@@ -86,6 +89,21 @@ def reply(reply_token: str, text: str):
     )
 
 
+def push(user_id: str, text: str):
+    requests.post(
+        'https://api.line.me/v2/bot/message/push',
+        headers={
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {CHANNEL_TOKEN}'
+        },
+        json={
+            'to': user_id,
+            'messages': [{'type': 'text', 'text': text}]
+        },
+        timeout=30
+    )
+
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     raw_body = request.get_data()
@@ -95,13 +113,32 @@ def webhook():
         abort(400)
 
     for event in json.loads(raw_body).get('events', []):
-        if event.get('type') == 'message' and event['message'].get('type') == 'image':
-            try:
-                image = get_line_image(event['message']['id'])
-                result = extract_info(image)
-                reply(event['replyToken'], result)
-            except Exception as e:
-                reply(event['replyToken'], f'エラーが発生しました。もう一度お試しください。\n({e})')
+        user_id = event.get('source', {}).get('userId', '')
+        reply_token = event.get('replyToken', '')
+        msg = event.get('message', {})
+
+        if event.get('type') != 'message':
+            continue
+
+        if msg.get('type') == 'image':
+            image = get_line_image(msg['id'])
+            if user_id not in user_images:
+                user_images[user_id] = []
+            user_images[user_id].append(image)
+            count = len(user_images[user_id])
+            reply(reply_token, f'画像を受け取りました（{count}枚）。\nすべて送り終わったら「完了」と送ってください。')
+
+        elif msg.get('type') == 'text' and msg.get('text', '').strip() == '完了':
+            images = user_images.pop(user_id, [])
+            if not images:
+                reply(reply_token, '画像が見つかりません。先に画像を送ってください。')
+            else:
+                reply(reply_token, '少々お待ちください...')
+                try:
+                    result = extract_info(images)
+                    push(user_id, result)
+                except Exception as e:
+                    push(user_id, f'エラーが発生しました。\n({e})')
 
     return 'OK'
 
