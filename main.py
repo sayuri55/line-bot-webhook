@@ -6,6 +6,12 @@ import json
 import requests
 from flask import Flask, request, abort
 import anthropic
+import hashlib
+import base64
+import json
+import requests
+from flask import Flask, request, abort
+import anthropic
 
 app = Flask(__name__)
 
@@ -17,18 +23,19 @@ user_images = {}
 
 PROMPT = (
     "複数の画像（申込書・電気代請求書・申込確認書など）を総合して情報を抽出してください。\n"
-    "【重要】複数の拠点・案件の書類が混在している場合は、案件ごとにフォーマットを繰り返して出力してください。\n"
+    "【重要】複数の拠点・案件の書類が混在している場合は、 して出力してください。\n"
     "案件と案件の間は「========」で区切ってください。\n"
     "フォーマット以外の文章は一切出力しないでください。\n\n"
     "【抽出ルール】\n"
-    "・地番：供給地点特定番号を入れる。必ず22桁の数字のみ。22桁でない場合は画像を読み直して正確な22桁を入れる。住所は絶対に入れない。\n"
-    "・住所：番地の数字とハイフンはすべて全角にする（例：4240-6→４２４０－６、1-2-3→１－２－３）。\n"
-    "・名義：申込確認書・請求書・お客様情報の「名義」「ご契約名義」「ご契約者」欄を最優先で使用する。申込書の「名称」欄は名義に使わない。スペースは全角スペースで入れる。漢字を正確に読み取ること。\n"
+    "・地番：供給地点特定番号を入れる。必ず22桁の数字のみ
+    "・住所：番地の数字とハイフンはすべて全角にする（例：4240-6→４２４０－６）。\n"
+    "・名義：申込確認書・請求書の「名義」「ご契約名義」「ご契約者」欄を最優先で使用する。申込書の「名称」欄は名義に使わない。スペースは全角スペー
+スで入れる。\n"
     "・カナ：スペース・空白は一切入れない。\n"
-    "・容量：数字とアルファベットのみ（例：60A、6KW）。B・低圧・電灯・動力・契約種別などの文字はすべて除く。\n"
-    "・電力会社：「ハルエネ」「東京電力」「地域創生」のように簡潔な名称で記載する。「株式会社」「でんき」「とくでんき」などは不要。\n"
-    "・客番：「お客様番号」「契約番号」と記載されている欄を優先して抽出する。見つからない場合は他の番号欄から探す。\n"
-    "・適用月：検針日の年月日（例：2026年6月13日）。検針日がない場合は利用期間の終了日の翌月の同日。\n"
+    "・容量：数字とアルファベットのみ（例：60A、6KW）。B すべて除く。\n"
+    "・電力会社：「ハルエネ」「東京電力」「地域創生」のように簡潔な名称で記載する。\n"
+    "・客番：「お客様番号」「契約番号」欄を優先して抽出する。\n"
+    "・適用月：検針日の年月日（例：2026年6月13日）。検針 の翌月の同日。\n"
     "・該当する情報が見つからない場合はその項目を空白のままにする。\n\n"
     "（登録契約情報）\n"
     "・生年月日：\n"
@@ -51,49 +58,42 @@ PROMPT = (
 )
 
 
-def verify_signature(body: bytes, signature: str) -> bool:
+def verify_signature(body, signature):
     digest = hmac.new(
         CHANNEL_SECRET.encode('utf-8'), body, hashlib.sha256
     ).digest()
-    return signature == base64.b64encode(digest).decode('utf-8')
+    return signature == base64.b64encode(digest).decode('
 
 
-def get_line_image(message_id: str) -> bytes:
+def get_line_image(message_id):
     res = requests.get(
-        f'https://api-data.line.me/v2/bot/message/{message_id}/content',
-        headers={'Authorization': f'Bearer {CHANNEL_TOKEN}'},
+        'https://api-data.line.me/v2/bot/message/' + mess
+        headers={'Authorization': 'Bearer ' + CHANNEL_TOKEN},
         timeout=15
     )
     res.raise_for_status()
     return res.content
 
 
-def to_fullwidth_address(text: str) -> str:
-    result = []
-    for ch in text:
-        if '0' <= ch <= '9':
-            result.append(chr(ord(ch) + 0xFEE0))
-        elif ch == '-':
-            result.append('－')
-        else:
-            result.append(ch)
-    return ''.join(result)
+def to_fullwidth_address(text):
+    table = str.maketrans('0123456789-', '\uff10\uff11\ufff17\uff18\uff19\uff0d')
+    return text.translate(table)
 
 
-def postprocess(text: str) -> str:
+def postprocess(text):
     lines = text.split('\n')
     result = []
     for line in lines:
-        if '住所：' in line:
-            idx = line.index('住所：') + len('住所：')
+        if '\u4f4f\u6240\uff1a' in line:
+            idx = line.index('\u4f4f\u6240\uff1a') + 3
             result.append(line[:idx] + to_fullwidth_address(line[idx:]))
         else:
             result.append(line)
     return '\n'.join(result)
 
 
-def extract_info(images_list: list) -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def extract_info(images_list):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KE
     content = []
     for img in images_list:
         content.append({
@@ -113,12 +113,12 @@ def extract_info(images_list: list) -> str:
     return postprocess(message.content[0].text)
 
 
-def reply(reply_token: str, text: str):
+def reply(reply_token, text):
     requests.post(
         'https://api.line.me/v2/bot/message/reply',
         headers={
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {CHANNEL_TOKEN}'
+            'Authorization': 'Bearer ' + CHANNEL_TOKEN
         },
         json={
             'replyToken': reply_token,
@@ -128,12 +128,12 @@ def reply(reply_token: str, text: str):
     )
 
 
-def push(user_id: str, text: str):
+def push(user_id, text):
     requests.post(
         'https://api.line.me/v2/bot/message/push',
         headers={
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {CHANNEL_TOKEN}'
+            'Authorization': 'Bearer ' + CHANNEL_TOKEN
         },
         json={
             'to': user_id,
@@ -146,7 +146,7 @@ def push(user_id: str, text: str):
 @app.route('/webhook', methods=['POST'])
 def webhook():
     raw_body = request.get_data()
-    signature = request.headers.get('X-Line-Signature', '')
+    signature = request.headers.get('X-Line-Signature', '
 
     if not verify_signature(raw_body, signature):
         abort(400)
@@ -165,25 +165,22 @@ def webhook():
                 user_images[user_id] = []
             user_images[user_id].append(image)
             count = len(user_images[user_id])
-            reply(reply_token, f'画像を受け取りました（{count}枚）。\nすべて送り終わったら「完了」と送ってください。')
+            reply(reply_token, '画像を受け取りました（' +送り終わったら「完了」と送ってください。')
 
         elif msg.get('type') == 'text' and msg.get('text', '').strip() == '完了':
             images = user_images.pop(user_id, [])
             if not images:
                 reply(reply_token, '画像が見つかりません。先に画像を送ってください。')
             else:
-                reply(reply_token, f'解析を開始します（{len(images)}枚）。少々お待ちください...')
-                reply(reply_token, '画像が見つかりません。先に画像を送ってください。')
-            else:
-                reply(reply_token, f'解析を開始します（{len(images)}枚）。少々お待ちください...')
+                reply(reply_token, '解析を開始します（' +々お待ちください...')
                 try:
                     result = extract_info(images)
                     push(user_id, result)
                 except Exception as e:
-                    push(user_id, f'エラーが発生しました。\n({e})')
+                    push(user_id, 'エラーが発生しました。
 
     return 'OK'
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT
