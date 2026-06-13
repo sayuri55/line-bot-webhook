@@ -5,22 +5,23 @@ import base64
 import json
 import requests
 from flask import Flask, request, abort
-import google.generativeai as genai
+import anthropic
 
 app = Flask(__name__)
 
 CHANNEL_SECRET = os.environ['LINE_CHANNEL_SECRET']
 CHANNEL_TOKEN  = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
-
-genai.configure(api_key=os.environ['GEMINI_API_KEY'])
+ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 
 user_images = {}
 
 PROMPT = (
-    "複数の画像（申込書・電気代請求書など）を総合して情報を抽出し、以下のフォーマットに出力してください。\n"
+    "複数の画像（申込書・電気代請求書など）を総合して情報を抽出してください。\n"
+    "【重要】複数の拠点・案件の書類が混在している場合は、案件ごとにフォーマットを繰り返して出力してください。\n"
+    "案件と案件の間は「========」で区切ってください。\n"
     "フォーマット以外の文章は一切出力しないでください。\n\n"
     "【抽出ルール】\n"
-    "・地番：供給地点特定番号（22桁の数字のみ）を入れる。数字以外は除く。住所は絶対に入れない。\n"
+    "・地番：供給地点特定番号（22桁の数字のみ）を入れる。住所は絶対に入れない。\n"
     "・名義：漢字を正確に読み取る。スペースは全角スペースで入れる。\n"
     "・カナ：スペース・空白は一切入れない。\n"
     "・容量：数字とアルファベットのみ（例：60A、6KW）。B・低圧・電灯・動力・契約種別などの文字はすべて除く。\n"
@@ -65,13 +66,24 @@ def get_line_image(message_id: str) -> bytes:
 
 
 def extract_info(images_list: list) -> str:
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    parts = []
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    content = []
     for img in images_list:
-        parts.append({'mime_type': 'image/jpeg', 'data': img})
-    parts.append(PROMPT)
-    response = model.generate_content(parts)
-    return response.text
+        content.append({
+            'type': 'image',
+            'source': {
+                'type': 'base64',
+                'media_type': 'image/jpeg',
+                'data': base64.b64encode(img).decode()
+            }
+        })
+    content.append({'type': 'text', 'text': PROMPT})
+    message = client.messages.create(
+        model='claude-opus-4-8',
+        max_tokens=4000,
+        messages=[{'role': 'user', 'content': content}]
+    )
+    return message.content[0].text
 
 
 def reply(reply_token: str, text: str):
@@ -100,7 +112,7 @@ def push(user_id: str, text: str):
             'to': user_id,
             'messages': [{'type': 'text', 'text': text}]
         },
-        timeout=30
+        timeout=60
     )
 
 
@@ -133,7 +145,7 @@ def webhook():
             if not images:
                 reply(reply_token, '画像が見つかりません。先に画像を送ってください。')
             else:
-                reply(reply_token, '少々お待ちください...')
+                reply(reply_token, f'解析を開始します（{len(images)}枚）。少々お待ちください...')
                 try:
                     result = extract_info(images)
                     push(user_id, result)
